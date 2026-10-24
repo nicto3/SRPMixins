@@ -1,0 +1,129 @@
+name: Build
+
+on:
+  push:
+    branches: [SRPMixins-v2.x]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  # Gradle (ForgeGradle 6) runs on JDK 17, the mod itself is compiled with the Java 8 toolchain.
+  # gradle.properties has java.installations.auto-download=false, so the JDK 8 from setup-java
+  # has to be pointed out explicitly. Xmx is raised because 1G can be tight for decompiling on CI.
+  GRADLE_ARGS: --stacktrace -Dorg.gradle.jvmargs=-Xmx3G -Porg.gradle.java.installations.fromEnv=JAVA_HOME_8_X64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8 + 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # the last one becomes the default JAVA_HOME
+          java-version: |
+            8
+            17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/SRPMixins-v2.x' }}
+
+      - name: Read mod version
+        id: meta
+        run: echo "version=$(grep -m1 '^mod_version=' gradle.properties | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Check that tag matches mod_version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match mod_version=$VERSION in gradle.properties"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew build $GRADLE_ARGS
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: SRPMixins-${{ steps.meta.outputs.version }}-${{ github.run_number }}
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+  # Tag vX.Y.Z -> GitHub Release with the jar attached
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.jar
+          generate_release_notes: true
+
+  # Optional: CurseForge + Modrinth via the publishMods task from build.gradle.
+  # Enabled only if the repo variable PUBLISH_TO_PLATFORMS is set to "true"
+  # (Settings -> Secrets and variables -> Actions -> Variables).
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PLATFORMS == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            8
+            17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
+
+      - name: Changelog from commits since previous tag
+        run: |
+          PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          {
+            echo 'CHANGELOG<<CHANGELOG_EOF'
+            git log ${PREV:+$PREV..}"$GITHUB_REF_NAME" --pretty='- %s'
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Publish to CurseForge / Modrinth
+        env:
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        run: |
+          chmod +x gradlew
+          ./gradlew build publishMods $GRADLE_ARGS
